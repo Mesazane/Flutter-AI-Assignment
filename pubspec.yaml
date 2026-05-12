@@ -1,0 +1,42 @@
+name: flutter_ai_assignment
+description: "Aplikasi Flutter pemilah sampah berbasis Edge AI (YOLO + TFLite)."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # === Edge AI / YOLO inference ===
+  # Menjalankan model .tflite langsung di perangkat (edge computing)
+  tflite_flutter: ^0.11.0
+
+  # === Kamera real-time ===
+  camera: ^0.11.0+2
+
+  # === Image preprocessing (resize, letterbox, normalize) ===
+  image: ^4.2.0
+
+  # === Permission runtime (CAMERA, dll) ===
+  permission_handler: ^11.3.1
+
+  # === Util ===
+  path_provider: ^2.1.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/models/
+    - assets/labels.txt
