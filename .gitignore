@@ -125,6 +125,9 @@ unlinked_spec.ds
 # Coverage
 coverage/
 
+# Model TFLite (file besar, di-download/-export terpisah)
+assets/models/*.tflite
+
 # Symbols & Obfuscation
 app.*.symbols
 app.*.map.json
