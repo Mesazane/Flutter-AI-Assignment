@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../main.dart' show availableCamerasList;
 import '../models/detection.dart';
@@ -25,21 +26,32 @@ class _CameraScreenState extends State<CameraScreen>
 
   bool _initializing = true;
   String? _errorMessage;
+
+  // Throttling: skip frames bila inferensi sebelumnya belum selesai.
   bool _isDetecting = false;
+  // Throttling tambahan: jangan mulai inferensi baru lebih cepat dari N ms
+  // setelah frame terakhir di-PROSES (bukan frame terakhir di-RECEIVE).
+  DateTime _lastInferenceEnd = DateTime.fromMillisecondsSinceEpoch(0);
+  static const Duration _minInterval = Duration(milliseconds: 100);
+
   List<Detection> _detections = const [];
+
+  // FPS counter: rata-rata dari beberapa frame terakhir.
+  final List<int> _frameTimesMs = [];
   int _fps = 0;
-  DateTime _lastFrameTime = DateTime.now();
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // === KEEP SCREEN AWAKE selama deteksi aktif ===
+    WakelockPlus.enable();
     _bootstrap();
   }
 
   Future<void> _bootstrap() async {
     try {
-      // 1. Minta permission kamera
+      // 1. Permission kamera
       final status = await Permission.camera.request();
       if (!status.isGranted) {
         setState(() {
@@ -50,7 +62,7 @@ class _CameraScreenState extends State<CameraScreen>
         return;
       }
 
-      // 2. Load model YOLO (edge AI)
+      // 2. Load model YOLO
       await _detector.loadModel();
 
       // 3. Inisialisasi kamera belakang
@@ -81,8 +93,6 @@ class _CameraScreenState extends State<CameraScreen>
       }
 
       _controller = controller;
-
-      // 4. Stream frame untuk deteksi real-time
       await controller.startImageStream(_onFrame);
 
       setState(() => _initializing = false);
@@ -95,29 +105,56 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   Future<void> _onFrame(CameraImage image) async {
-    // Drop frame jika inferensi sebelumnya belum selesai supaya tidak menumpuk.
+    // 1. Skip kalau inferensi sebelumnya masih jalan.
     if (_isDetecting) return;
+
+    // 2. Skip kalau jeda dari inferensi terakhir terlalu singkat — beri waktu
+    //    isolate UI untuk render frame & responsif terhadap touch.
+    final sinceLast = DateTime.now().difference(_lastInferenceEnd);
+    if (sinceLast < _minInterval) return;
+
     _isDetecting = true;
+    final inferStart = DateTime.now();
 
     try {
       final converted = cameraImageToImage(image);
-      final results = _detector.detect(converted);
+      final results = await _detector.detect(converted);
 
       if (!mounted) return;
 
-      final now = DateTime.now();
-      final dt = now.difference(_lastFrameTime).inMilliseconds;
-      _lastFrameTime = now;
+      // Update FPS rata-rata (window 10 frame).
+      final dt = DateTime.now().difference(inferStart).inMilliseconds;
+      _frameTimesMs.add(dt);
+      if (_frameTimesMs.length > 10) _frameTimesMs.removeAt(0);
+      final avg = _frameTimesMs.reduce((a, b) => a + b) / _frameTimesMs.length;
+      final newFps = avg > 0 ? (1000 / avg).round() : 0;
 
-      setState(() {
-        _detections = results;
-        _fps = dt > 0 ? (1000 / dt).round() : 0;
-      });
+      // 3. Hanya setState kalau hasil benar-benar berubah ATAU FPS berubah —
+      //    mencegah rebuild + repaint yang sia-sia tiap frame.
+      final changed = !_sameDetections(results, _detections) ||
+          (newFps - _fps).abs() >= 2;
+      if (changed) {
+        setState(() {
+          _detections = results;
+          _fps = newFps;
+        });
+      }
     } catch (e) {
       debugPrint('Inference error: $e');
     } finally {
+      _lastInferenceEnd = DateTime.now();
       _isDetecting = false;
     }
+  }
+
+  /// Cek dua list deteksi "sama" cukup berdasarkan jumlah & class id
+  /// (geometri box sengaja diabaikan supaya tidak rebuild tiap pergerakan kecil).
+  bool _sameDetections(List<Detection> a, List<Detection> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i].classId != b[i].classId) return false;
+    }
+    return true;
   }
 
   @override
@@ -127,14 +164,18 @@ class _CameraScreenState extends State<CameraScreen>
 
     if (state == AppLifecycleState.inactive) {
       controller.stopImageStream();
+      WakelockPlus.disable();
     } else if (state == AppLifecycleState.resumed) {
       controller.startImageStream(_onFrame);
+      WakelockPlus.enable();
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // === Pulihkan layar normal (boleh dim lagi) saat keluar screen ===
+    WakelockPlus.disable();
     _controller?.stopImageStream();
     _controller?.dispose();
     _detector.dispose();
@@ -223,15 +264,12 @@ class _CameraScreenState extends State<CameraScreen>
     return Stack(
       fit: StackFit.expand,
       children: [
-        // Preview kamera
         Center(
           child: AspectRatio(
             aspectRatio: controller.value.aspectRatio,
             child: CameraPreview(controller),
           ),
         ),
-
-        // Bounding boxes
         Center(
           child: AspectRatio(
             aspectRatio: controller.value.aspectRatio,
@@ -240,8 +278,6 @@ class _CameraScreenState extends State<CameraScreen>
             ),
           ),
         ),
-
-        // Panel hasil di bawah
         Positioned(
           left: 0,
           right: 0,
@@ -259,7 +295,6 @@ class _ResultPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Ringkasan: hitung per-kategori.
     final counts = <WasteCategory, int>{};
     for (final d in detections) {
       counts[d.category] = (counts[d.category] ?? 0) + 1;

@@ -11,13 +11,16 @@ import '../models/waste_category.dart';
 
 /// Service inferensi YOLOv8 berjalan SEPENUHNYA di device (edge computing).
 ///
-/// Format model yang didukung:
-///   - File: assets/models/yolov8n.tflite (atau nama lain, lihat [modelAsset])
-///   - Input  : float32 [1, 640, 640, 3], dinormalisasi 0..1, urutan RGB
-///   - Output : float32 [1, 84, 8400]  (4 box + 80 kelas, format YOLOv8)
+/// Optimasi performa yang diterapkan:
+///   * `IsolateInterpreter` — inferensi TFLite jalan di worker isolate,
+///     thread UI tidak ter-block (FPS jauh lebih stabil).
+///   * Konversi pixel pakai `getBytes()` flat buffer (1 loop typed) — jauh
+///     lebih cepat dibanding `getPixel()` per-pixel.
 ///
-/// Jika kamu pakai model dengan jumlah kelas berbeda (mis. custom 6 kelas),
-/// pastikan [numClasses] di-set otomatis berdasarkan output tensor.
+/// Format model yang didukung:
+///   - File   : `assets/models/yolov8n_float32.tflite` (default)
+///   - Input  : float32 [1, 640, 640, 3], normalisasi 0..1, urutan RGB
+///   - Output : float32 [1, 84, 8400]  (4 box + 80 kelas, format YOLOv8)
 class YoloDetector {
   YoloDetector({
     this.modelAsset = 'assets/models/yolov8n_float32.tflite',
@@ -34,11 +37,12 @@ class YoloDetector {
   final int inputSize;
 
   Interpreter? _interpreter;
+  IsolateInterpreter? _isolateInterpreter;
   List<String> _labels = const [];
   late int _numClasses;
   late int _numAnchors;
 
-  bool get isReady => _interpreter != null;
+  bool get isReady => _isolateInterpreter != null;
   List<String> get labels => _labels;
 
   /// Load model + labels. Panggil sekali sebelum [detect].
@@ -51,7 +55,7 @@ class YoloDetector {
         .where((e) => e.isNotEmpty)
         .toList();
 
-    // 2. Interpreter. Coba GPU/NNAPI delegate dulu, fallback ke CPU.
+    // 2. Interpreter "biasa" — hanya dipakai untuk membaca metadata tensor.
     final options = InterpreterOptions()..threads = 4;
     try {
       _interpreter = await Interpreter.fromAsset(
@@ -68,7 +72,6 @@ class YoloDetector {
 
     // 3. Cek shape output untuk menentukan jumlah kelas & anchor.
     final outShape = _interpreter!.getOutputTensor(0).shape;
-    // outShape umum: [1, 84, 8400] → 84 = 4 + numClasses
     if (outShape.length != 3) {
       throw Exception(
         'Bentuk output model tidak dikenal: $outShape. '
@@ -77,21 +80,29 @@ class YoloDetector {
     }
     _numClasses = outShape[1] - 4;
     _numAnchors = outShape[2];
+
+    // 4. Bungkus interpreter dengan IsolateInterpreter supaya `run()` async
+    //    dan dieksekusi di isolate terpisah — thread UI tidak ter-block.
+    _isolateInterpreter = await IsolateInterpreter.create(
+      address: _interpreter!.address,
+    );
   }
 
-  /// Tutup interpreter.
-  void dispose() {
+  /// Tutup interpreter & isolate.
+  Future<void> dispose() async {
+    await _isolateInterpreter?.close();
     _interpreter?.close();
+    _isolateInterpreter = null;
     _interpreter = null;
   }
 
-  /// Jalankan deteksi pada [image]. [image] adalah objek dari package `image`.
+  /// Jalankan deteksi pada [image].
   ///
-  /// Mengembalikan list [Detection] dengan koordinat box dalam 0..1
-  /// (relatif terhadap ukuran [image] aslinya, BUKAN 640×640).
-  List<Detection> detect(img.Image image) {
-    final interp = _interpreter;
-    if (interp == null) {
+  /// Mengembalikan list [Detection] dengan koordinat box ternormalisasi
+  /// (0..1) relatif terhadap ukuran [image] aslinya.
+  Future<List<Detection>> detect(img.Image image) async {
+    final isolateInterp = _isolateInterpreter;
+    if (isolateInterp == null) {
       throw StateError('Interpreter belum di-load. Panggil loadModel() dulu.');
     }
 
@@ -99,7 +110,7 @@ class YoloDetector {
     final letterboxed = _letterbox(image, inputSize);
 
     // === 2. Konversi ke Float32 [1, 640, 640, 3], normalisasi 0..1 ===
-    final inputBuffer = _imageToFloat32(letterboxed.image, inputSize);
+    final inputBuffer = _imageToFloat32(letterboxed.image);
     final input = inputBuffer.reshape([1, inputSize, inputSize, 3]);
 
     // === 3. Siapkan output buffer ===
@@ -111,14 +122,13 @@ class YoloDetector {
       ),
     );
 
-    // === 4. Inference ===
-    interp.run(input, output);
+    // === 4. Inference ASYNC di worker isolate (non-blocking UI) ===
+    await isolateInterp.run(input, output);
 
     // === 5. Parse output → list Detection sebelum NMS ===
     final raw = <_RawDet>[];
     final result = output[0];
     for (int i = 0; i < _numAnchors; i++) {
-      // Cari kelas dengan skor tertinggi untuk anchor ke-i.
       double bestScore = 0;
       int bestClass = -1;
       for (int c = 0; c < _numClasses; c++) {
@@ -130,22 +140,16 @@ class YoloDetector {
       }
       if (bestScore < confidenceThreshold || bestClass < 0) continue;
 
-      // Box YOLOv8 = (cx, cy, w, h) dalam koordinat input 640×640.
       final cx = result[0][i];
       final cy = result[1][i];
       final w = result[2][i];
       final h = result[3][i];
 
-      final x1 = (cx - w / 2);
-      final y1 = (cy - h / 2);
-      final x2 = (cx + w / 2);
-      final y2 = (cy + h / 2);
-
       raw.add(_RawDet(
-        x1: x1,
-        y1: y1,
-        x2: x2,
-        y2: y2,
+        x1: cx - w / 2,
+        y1: cy - h / 2,
+        x2: cx + w / 2,
+        y2: cy + h / 2,
         score: bestScore,
         classId: bestClass,
       ));
@@ -154,10 +158,9 @@ class YoloDetector {
     // === 6. Non-Max Suppression ===
     final kept = _nms(raw, iouThreshold);
 
-    // === 7. Map ke koordinat citra asli (0..1 relatif gambar input asli) ===
+    // === 7. Map ke koordinat citra asli, normalisasi 0..1 ===
     final detections = <Detection>[];
     for (final r in kept) {
-      // Hapus padding letterbox, lalu skala ke ukuran asli.
       final origRect = _unletterbox(
         Rect.fromLTRB(r.x1, r.y1, r.x2, r.y2),
         letterboxed.scale,
@@ -167,7 +170,6 @@ class YoloDetector {
         image.height,
       );
 
-      // Normalisasi terhadap ukuran citra asli (0..1) agar mudah dipakai painter.
       final normalized = Rect.fromLTRB(
         (origRect.left / image.width).clamp(0.0, 1.0),
         (origRect.top / image.height).clamp(0.0, 1.0),
@@ -207,7 +209,7 @@ class YoloDetector {
     );
 
     final canvas = img.Image(width: targetSize, height: targetSize);
-    img.fill(canvas, color: img.ColorRgb8(114, 114, 114)); // YOLO default gray
+    img.fill(canvas, color: img.ColorRgb8(114, 114, 114));
     img.compositeImage(canvas, resized, dstX: padX, dstY: padY);
 
     return _LetterboxResult(
@@ -238,16 +240,17 @@ class YoloDetector {
     );
   }
 
-  Float32List _imageToFloat32(img.Image image, int size) {
-    final buffer = Float32List(size * size * 3);
-    int idx = 0;
-    for (int y = 0; y < size; y++) {
-      for (int x = 0; x < size; x++) {
-        final p = image.getPixel(x, y);
-        buffer[idx++] = p.r / 255.0;
-        buffer[idx++] = p.g / 255.0;
-        buffer[idx++] = p.b / 255.0;
-      }
+  /// Konversi `img.Image` (RGB) → Float32List ternormalisasi 0..1.
+  ///
+  /// PENTING: pakai `getBytes()` untuk akses buffer flat — satu loop typed-list
+  /// jauh lebih cepat dibanding `image.getPixel(x,y).r/.g/.b` per-pixel.
+  /// Untuk 640×640 px, perbedaan kecepatan bisa ~10×.
+  Float32List _imageToFloat32(img.Image image) {
+    final bytes = image.getBytes(order: img.ChannelOrder.rgb);
+    final buffer = Float32List(bytes.length);
+    const inv255 = 1.0 / 255.0;
+    for (int i = 0; i < bytes.length; i++) {
+      buffer[i] = bytes[i] * inv255;
     }
     return buffer;
   }
