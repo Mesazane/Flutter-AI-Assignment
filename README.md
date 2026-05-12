@@ -1,5 +1,10 @@
 # EcoSort AI — Flutter Edge AI Waste Sorter
 
+##Screenshot:
+<img width="1440" height="3088" alt="Screenshot_20260512_090308" src="https://github.com/user-attachments/assets/e73e449e-cd24-4a80-b0e8-21c9ae85048f" />
+<img width="3088" height="1440" alt="Screenshot_20260512_090519" src="https://github.com/user-attachments/assets/05619a3a-b5a6-4da0-ba21-b810cfc94f5d" />
+
+
 Aplikasi Flutter yang memakai **YOLO (TensorFlow Lite)** secara **lokal di
 perangkat (edge computing)** untuk mengenali objek lewat kamera dan
 mengklasifikasikannya ke dalam **3 kategori sampah Indonesia**:
